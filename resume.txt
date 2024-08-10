@@ -1,0 +1,237 @@
+drizzle is javascript orm build using only javascript and can be used in so many scenarios like, react-native, node, and so on. Today i will show you how to use it in an electron application and in the best way possible, following the official electron docs recomendation.
+
+Creating the project
+I will use the official electron template from vite with typescript in this article, so lets run this code to start up our project.
+
+npm create vite@latest bsql3-electron  -- --template
+Some options will be shown, select Others and then create-electron-vite. you choose any framework/library in the project template section.
+
+Setting up Better-sqlite3
+First of all lets install better-sqlite3, you can do it by runnig this code
+
+npm i better-sqlite3
+now inside your vite.confi.js lets create the better-sqlite bidding plugin for your vite.
+
+function bindingSqlite3(
+  options: {
+    output?: string;
+    better_sqlite3_node?: string;
+    command?: string;
+  } = {}
+): Plugin {
+  const TAG = '[vite-plugin-binding-sqlite3]';
+  options.output ??= 'dist-native';
+  options.better_sqlite3_node ??= 'better_sqlite3.node';
+  options.command ??= 'build';
+
+  return {
+    name: 'vite-plugin-binding-sqlite3',
+    config(config) {
+      // https://github.com/vitejs/vite/blob/v4.4.9/packages/vite/src/node/config.ts#L496-L499
+      const resolvedRoot = normalizePath(
+        config.root ? path.resolve(config.root) : process.cwd()
+      );
+      const output = path.posix.resolve(resolvedRoot, options.output || '');
+      const better_sqlite3 = require.resolve('better-sqlite3');
+      const better_sqlite3_root = path.posix.join(
+        better_sqlite3.slice(0, better_sqlite3.lastIndexOf('node_modules')),
+        'node_modules/better-sqlite3'
+      );
+      const better_sqlite3_node = path.posix.join(
+        better_sqlite3_root,
+        'build/Release',
+        options.better_sqlite3_node || ''
+      );
+      const better_sqlite3_copy = path.posix.join(
+        output,
+        options.better_sqlite3_node || ''
+      );
+      if (!fs.existsSync(better_sqlite3_node)) {
+        throw new Error(`${TAG} Can not found "${better_sqlite3_node}".`);
+      }
+      if (!fs.existsSync(output)) {
+        fs.mkdirSync(output, { recursive: true });
+      }
+      fs.copyFileSync(better_sqlite3_node, better_sqlite3_copy);
+      /** `dist-native/better_sqlite3.node` */
+      const BETTER_SQLITE3_BINDING = better_sqlite3_copy.replace(
+        resolvedRoot + '/',
+        ''
+      );
+      fs.writeFileSync(
+        path.join(resolvedRoot, '.env'),
+        `VITE_BETTER_SQLITE3_BINDING=${BETTER_SQLITE3_BINDING}`
+      );
+
+      console.log(TAG, `binding to ${BETTER_SQLITE3_BINDING}`);
+    }
+  };
+}
+now referece it in your defineConfig function from vite.config.ts
+
+export default defineConfig(({ command }) => {
+  return {
+    plugins: [
+      react(),
+      electron({
+        main: {
+          entry: 'electron/main.ts'
+        },
+        preload: {
+          input: path.join(__dirname, 'electron/preload.ts')
+        },
+        renderer:
+          process.env.NODE_ENV === 'test'
+              undefined
+            : {}
+      }),
+      bindingSqlite3({ command })
+    ]
+  };
+});
+ Setting up the better-sqlite3 in the main process 
+in your preload file expose a function to the renderer process send sqlite querys that will be processed and sent back to it.
+
+contextBridge.exposeInMainWorld('ipcRenderer', {
+  query: (...props: unknown[]) => ipcRenderer.invoke('query', ...props)
+})
+as we create a invoke function lets create a handler for it, put this code in the main file.
+
+import { ipcMain } from 'electron';
+
+import type { Query } from 'drizzle-orm';
+
+let sqlite3: Database;
+
+ipcMain.handle('query', (_, { sql, params }: Query) => {
+  const query = sqlite3.prepare(sql);
+
+  const output = query.reader ? query.all(...params) : query.run(...params);
+
+  return output;
+});
+If you want to have a nice typescript support, you can apply this code to your electron-env.d.ts 
+
+interface Window {
+  ipcRenderer: import('electron').IpcRenderer & {
+    database: Database;
+    query: (d: import('drizzle-orm').Query) => Promise<unknown>;
+  }
+}
+but untill now we dont create the better-sqlite3 database connection, lets do it.
+
+Inside your electron folder create database folder and a better-sqlite3 inside it.
+
+import { app } from 'electron';
+
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+
+import Database from 'better-sqlite3';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const root = path.join(__dirname, '..');
+
+const require = createRequire(import.meta.url);
+
+let database: Database.Database;
+
+export function getSqlite3(
+  filename = path.join(app.getPath('userData'), 'better-sqlite3.sqlite3')
+) {
+  const nativeBinding = path.join(
+    root,
+    import.meta.env.VITE_BETTER_SQLITE3_BINDING
+  );
+
+  database ??= new Database(filename, {
+    nativeBinding: require(nativeBinding)
+  });
+
+  database.pragma('journal_mode = WAL');
+
+  return database;
+}
+
+run this function in the whenReady promises callback
+
+app.whenReady().then(() => {
+  sqlite3 = getSqlite3();
+
+  createWindow();
+});
+Setting up Drizzle
+as before lets intall the require dependencies
+
+npm i drizzle-orm && npm i -D drizzle-kit
+create the drizzle.config.ts file
+
+import { defineConfig } from 'drizzle-kit';
+
+export default defineConfig({
+  schema: './electron/database/schema.ts',
+  out: './drizzle',
+
+  dialect: 'sqlite'
+});
+
+and create the schema file inside the database folder that we create before, i will place i simple user table as example.
+
+import { sql } from 'drizzle-orm';
+import { text, integer, sqliteTable } from 'drizzle-orm/sqlite-core';
+
+export const users = sqliteTable('users', {
+  id: integer('id').primaryKey(),
+  name: text('name'),
+  birthDate: text('birth_date')
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`)
+});
+With the schema already created, run this to generate the migration files.
+
+npx drizzle-kit generate
+finally, lets run our migration
+
+app.whenReady().then(() => {
+  sqlite3 = getSqlite3();
+  const db = drizzle(sqlite3);
+
+  try {
+    migrate(db, { migrationsFolder: './drizzle' });
+  } catch (err) {
+    console.error('migration run error: ', err);
+  }
+
+  createWindow()
+})
+you can run your code now, if you get this issue "The module * was compiled against a different Node.js version using." it mean the this dependencie(better-sqlite3 in our case) was compiled using a diferent node version, so we need to re-compile it using our node. you can do it by using electron-rebuild, after install it with npm i electron-rebuild you run this code
+
+npx electron-rebuild -f -w better-sqlite3
+you can place it in yor package.json scripts
+
+{
+   "scripts": {
+        "postinstall": "npm run rebuild",
+        "rebuild": "electron-rebuild -f -w better-sqlite3"
+    }
+}
+Create and executing our querys 
+Finally come to your renderer process and place run the ipcRenderer call caller query that we created before. i created this simple test code.
+
+import type { Database } from 'better-sqlite3';
+
+import * as schema from '../electron/database/schema';
+
+const client = drizzle({} as Database, { schema });
+
+const query = client.insert(schema.users).values({name: 'John doe'}).toSQL()
+
+window.ipcRenderer.query(query).then(async () => {
+  const query = client.query.users.findMany().toSQL()
+
+  const output = await window.ipcRenderer.query(query)
+
+  console.log(output)
+})
